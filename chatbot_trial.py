@@ -18,10 +18,11 @@ DEFAULT_OPENAI_KEY = (
 
 @dataclass
 class HistoricalStats:
-    load_groups: Dict[str, List[str]]
+    load_groups: Dict[str, List[str]]  # LOAD_NO -> list of ITEM_NOs
     combo_frequency: Counter
     pair_frequency: Counter
     item_attributes: Dict[str, Dict[str, Any]]  # ITEM_NO -> attributes dict
+    load_details: Dict[str, Dict[str, Any]]  # LOAD_NO -> complete load details
 
 
 class SteelLoadingPlanner:
@@ -100,6 +101,54 @@ class SteelLoadingPlanner:
                         attrs[col] = None
             item_attributes[item_no] = attrs
 
+        # Build detailed load information for each LOAD_NO
+        load_details: Dict[str, Dict[str, Any]] = {}
+        for load_no, items in load_groups.items():
+            load_df = self.dataframe[self.dataframe["LOAD_NO"] == load_no]
+            
+            # Get all items in this load
+            unique_items = list(dict.fromkeys(items))
+            
+            # Calculate aggregate statistics
+            total_weight_kg = 0.0
+            total_weight_ton = 0.0
+            total_pieces = 0
+            
+            item_details = []
+            for item_no in unique_items:
+                item_rows = load_df[load_df["ITEM_NO"] == item_no]
+                if len(item_rows) > 0:
+                    item_data = item_rows.iloc[0]
+                    item_attrs = {}
+                    for col in attribute_columns:
+                        if col in self.dataframe.columns:
+                            value = item_data[col]
+                            if pd.notna(value):
+                                if col in ["FG_PRODUCTION_WT_KG", "ORDER_PIECES", "重量（吨）"]:
+                                    try:
+                                        item_attrs[col] = float(value)
+                                        if col == "FG_PRODUCTION_WT_KG":
+                                            total_weight_kg += float(value)
+                                        elif col == "重量（吨）":
+                                            total_weight_ton += float(value)
+                                        elif col == "ORDER_PIECES":
+                                            total_pieces += int(value)
+                                    except (ValueError, TypeError):
+                                        pass
+                                else:
+                                    item_attrs[col] = value
+                    item_details.append({"ITEM_NO": item_no, "attributes": item_attrs})
+            
+            load_details[load_no] = {
+                "items": unique_items,
+                "item_set": set(unique_items),
+                "item_count": len(unique_items),
+                "total_weight_kg": total_weight_kg,
+                "total_weight_ton": total_weight_ton,
+                "total_pieces": total_pieces,
+                "item_details": item_details,
+            }
+
         for items in grouped:
             unique_items = list(dict.fromkeys(items))  # preserve order, drop duplicates
             combo_counter[frozenset(unique_items)] += 1
@@ -114,6 +163,7 @@ class SteelLoadingPlanner:
             combo_frequency=combo_counter,
             pair_frequency=pair_counter,
             item_attributes=item_attributes,
+            load_details=load_details,
         )
 
     def _init_openai_client(self, api_key: Optional[str]) -> Optional[OpenAI]:
@@ -186,6 +236,79 @@ class SteelLoadingPlanner:
     def get_context_summary(self) -> str:
         """Public accessor for the textual summary of historical patterns."""
         return self._build_context_summary()
+    
+    def find_similar_loads(
+        self,
+        new_items: Sequence[str],
+        item_attributes: Optional[Dict[str, Dict[str, Any]]] = None,
+        top_k: int = 5
+    ) -> List[Tuple[str, float, Dict[str, Any]]]:
+        """
+        Find similar historical loading cases (LOAD_NO) based on input items.
+        
+        Args:
+            new_items: List of ITEM_NO identifiers
+            item_attributes: Optional dict mapping ITEM_NO to physical attributes
+            top_k: Number of similar cases to return
+            
+        Returns:
+            List of tuples: (LOAD_NO, similarity_score, load_details)
+        """
+        new_items_set = set(str(item).strip() for item in new_items)
+        
+        # Calculate aggregate statistics for new items
+        new_total_weight_kg = 0.0
+        new_total_weight_ton = 0.0
+        new_total_pieces = 0
+        
+        if item_attributes:
+            for item_no in new_items:
+                attrs = item_attributes.get(item_no, {})
+                if attrs:
+                    if attrs.get("FG_PRODUCTION_WT_KG"):
+                        new_total_weight_kg += float(attrs["FG_PRODUCTION_WT_KG"])
+                    if attrs.get("重量（吨）"):
+                        new_total_weight_ton += float(attrs["重量（吨）"])
+                    if attrs.get("ORDER_PIECES"):
+                        new_total_pieces += int(attrs["ORDER_PIECES"])
+        
+        similarities = []
+        
+        for load_no, load_info in self.history.load_details.items():
+            hist_items_set = load_info["item_set"]
+            
+            # Calculate Jaccard similarity for item sets
+            intersection = len(new_items_set & hist_items_set)
+            union = len(new_items_set | hist_items_set)
+            jaccard_sim = intersection / union if union > 0 else 0.0
+            
+            # Calculate weight similarity (if available)
+            weight_sim = 0.0
+            if new_total_weight_kg > 0 and load_info["total_weight_kg"] > 0:
+                weight_diff = abs(new_total_weight_kg - load_info["total_weight_kg"])
+                weight_avg = (new_total_weight_kg + load_info["total_weight_kg"]) / 2
+                weight_sim = 1.0 - min(weight_diff / weight_avg, 1.0) if weight_avg > 0 else 0.0
+            
+            # Calculate pieces similarity
+            pieces_sim = 0.0
+            if new_total_pieces > 0 and load_info["total_pieces"] > 0:
+                pieces_diff = abs(new_total_pieces - load_info["total_pieces"])
+                pieces_avg = (new_total_pieces + load_info["total_pieces"]) / 2
+                pieces_sim = 1.0 - min(pieces_diff / pieces_avg, 1.0) if pieces_avg > 0 else 0.0
+            
+            # Combined similarity score (weighted)
+            # Jaccard similarity is most important (50%), weight and pieces each 25%
+            combined_sim = (
+                jaccard_sim * 0.5 +
+                weight_sim * 0.25 +
+                pieces_sim * 0.25
+            )
+            
+            similarities.append((load_no, combined_sim, load_info))
+        
+        # Sort by similarity and return top_k
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        return similarities[:top_k]
 
     def plan_with_history(self, new_items: Sequence[str]) -> List[List[str]]:
         """
@@ -251,21 +374,58 @@ class SteelLoadingPlanner:
         if use_history_plan:
             baseline_plan = self.plan_with_history(new_items)
 
-        context_summary = self._build_context_summary()
         new_items_list = [str(item).strip() for item in new_items if str(item).strip()]
-
+        
+        # Find similar historical loading cases
+        similar_loads = self.find_similar_loads(new_items, item_attributes, top_k=5)
+        
         system_prompt = (
             "You are a logistics planner specialising in loading plans for steel transport. "
             "Consider physical dimensions (length, width, height, diameter), weight, quantity, "
-            "and shape when making loading decisions. Leverage historical patterns to recommend "
-            "efficient groupings while keeping practical constraints in mind. "
+            "and shape when making loading decisions. Use similar historical loading cases as reference "
+            "to recommend efficient groupings while keeping practical constraints in mind. "
             "Answer in concise natural language, clearly listing each truck and its assigned steel items."
         )
 
-        user_prompt = (
-            f"Historical summary:\n{context_summary}\n\n"
-            f"New steel items to load (ITEM_NO): {new_items_list}\n"
-        )
+        # Build prompt with similar cases
+        user_prompt = f"New steel items to load (ITEM_NO): {new_items_list}\n\n"
+        
+        if similar_loads:
+            user_prompt += "Similar historical loading cases found:\n\n"
+            for idx, (load_no, sim_score, load_info) in enumerate(similar_loads, 1):
+                user_prompt += f"Case {idx} (LOAD_NO: {load_no}, Similarity: {sim_score:.2%}):\n"
+                user_prompt += f"  Items: {', '.join(load_info['items'])}\n"
+                user_prompt += f"  Total weight: {load_info['total_weight_kg']:.2f} kg"
+                if load_info['total_weight_ton'] > 0:
+                    user_prompt += f" ({load_info['total_weight_ton']:.3f} ton)"
+                user_prompt += f"\n  Total pieces: {load_info['total_pieces']}\n"
+                
+                # Add item details with attributes
+                if load_info['item_details']:
+                    user_prompt += "  Item details:\n"
+                    for item_detail in load_info['item_details'][:10]:  # Limit to first 10 items
+                        item_no = item_detail['ITEM_NO']
+                        attrs = item_detail['attributes']
+                        user_prompt += f"    {item_no}: "
+                        attr_parts = []
+                        if attrs.get("长（毫米）"):
+                            attr_parts.append(f"L={attrs['长（毫米）']:.0f}mm")
+                        if attrs.get("宽（毫米）"):
+                            attr_parts.append(f"W={attrs['宽（毫米）']:.0f}mm")
+                        if attrs.get("高（毫米）"):
+                            attr_parts.append(f"H={attrs['高（毫米）']:.0f}mm")
+                        if attrs.get("FG_PRODUCTION_WT_KG"):
+                            attr_parts.append(f"Weight={attrs['FG_PRODUCTION_WT_KG']:.2f}kg")
+                        if attrs.get("ORDER_PIECES"):
+                            attr_parts.append(f"Pieces={int(attrs['ORDER_PIECES'])}")
+                        if attrs.get("形状"):
+                            attr_parts.append(f"Shape={attrs['形状']}")
+                        user_prompt += ", ".join(attr_parts) + "\n"
+                user_prompt += "\n"
+        else:
+            # Fallback to general summary if no similar cases found
+            context_summary = self._build_context_summary()
+            user_prompt += f"Historical summary:\n{context_summary}\n\n"
 
         # Add physical attributes for new items with better formatting
         def format_attribute_value(key: str, value: Any) -> str:
@@ -349,9 +509,22 @@ class SteelLoadingPlanner:
 
         response_text = self._call_openai(system_prompt, user_prompt, temperature)
 
+        # Format similar loads for return
+        similar_cases = []
+        for load_no, sim_score, load_info in similar_loads:
+            similar_cases.append({
+                "load_no": load_no,
+                "similarity": sim_score,
+                "items": load_info["items"],
+                "total_weight_kg": load_info["total_weight_kg"],
+                "total_weight_ton": load_info["total_weight_ton"],
+                "total_pieces": load_info["total_pieces"],
+            })
+
         return {
             "baseline_plan": baseline_plan or [],
             "response_text": response_text,
+            "similar_cases": similar_cases,
         }
 
     def _call_openai(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
@@ -840,6 +1013,24 @@ def run_streamlit_app() -> None:
             st.markdown(response_text)
         else:
             st.warning("The model did not return any content.")
+
+        # Display similar historical cases used
+        similar_cases = openai_result.get("similar_cases", [])
+        if similar_cases:
+            with st.expander("Similar historical loading cases used as reference", expanded=False):
+                for idx, case in enumerate(similar_cases, 1):
+                    st.write(f"**Case {idx}** (LOAD_NO: {case['load_no']}, Similarity: {case['similarity']:.1%})")
+                    items_display = ', '.join(case['items'][:10])
+                    if len(case['items']) > 10:
+                        items_display += f" ... and {len(case['items']) - 10} more items"
+                    st.write(f"- Items: {items_display}")
+                    weight_text = f"- Total weight: {case['total_weight_kg']:.2f} kg"
+                    if case['total_weight_ton'] > 0:
+                        weight_text += f" ({case['total_weight_ton']:.3f} ton)"
+                    st.write(weight_text)
+                    st.write(f"- Total pieces: {case['total_pieces']}")
+                    if idx < len(similar_cases):
+                        st.divider()
 
         # Display physical attributes used in planning
         if item_attributes and parsed_items:
