@@ -4,7 +4,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 from openai import OpenAI
@@ -267,36 +267,69 @@ class SteelLoadingPlanner:
             f"New steel items to load (ITEM_NO): {new_items_list}\n"
         )
 
-        # Add physical attributes for new items
+        # Add physical attributes for new items with better formatting
+        def format_attribute_value(key: str, value: Any) -> str:
+            """Format attribute value for display."""
+            if value is None:
+                return "N/A"
+            if isinstance(value, (int, float)):
+                if key in ["长（毫米）", "宽（毫米）", "高（毫米）", "直径（毫米）"]:
+                    return f"{value:.2f} mm"
+                elif key == "FG_PRODUCTION_WT_KG":
+                    return f"{value:.2f} kg"
+                elif key == "重量（吨）":
+                    return f"{value:.3f} ton"
+                elif key == "ORDER_PIECES":
+                    return f"{int(value)} pieces"
+                else:
+                    return str(value)
+            return str(value)
+        
+        def format_attributes_for_display(attrs: Dict[str, Any], source: str = "") -> List[str]:
+            """Format attributes into readable lines."""
+            attr_lines = []
+            # Map Chinese column names to English for better readability
+            attr_mapping = {
+                "长（毫米）": "Length",
+                "宽（毫米）": "Width", 
+                "高（毫米）": "Height",
+                "直径（毫米）": "Diameter",
+                "FG_PRODUCTION_WT_KG": "Weight (kg)",
+                "ORDER_PIECES": "Pieces",
+                "重量（吨）": "Weight (ton)",
+                "形状": "Shape"
+            }
+            
+            for key, value in attrs.items():
+                if value is not None:
+                    display_key = attr_mapping.get(key, key)
+                    formatted_value = format_attribute_value(key, value)
+                    attr_lines.append(f"    {display_key}: {formatted_value}")
+            return attr_lines
+        
         if item_attributes:
             user_prompt += "\nPhysical attributes of new items:\n"
             for item_no in new_items_list:
                 attrs = item_attributes.get(item_no, {})
-                if attrs:
+                if attrs and any(v is not None for v in attrs.values()):
                     attr_lines = [f"  {item_no}:"]
-                    for key, value in attrs.items():
-                        if value is not None:
-                            attr_lines.append(f"    {key}: {value}")
+                    attr_lines.extend(format_attributes_for_display(attrs))
                     user_prompt += "\n".join(attr_lines) + "\n"
                 else:
                     # Try to get from historical data if available
                     hist_attrs = self.history.item_attributes.get(item_no, {})
-                    if hist_attrs:
+                    if hist_attrs and any(v is not None for v in hist_attrs.values()):
                         attr_lines = [f"  {item_no} (from history):"]
-                        for key, value in hist_attrs.items():
-                            if value is not None:
-                                attr_lines.append(f"    {key}: {value}")
+                        attr_lines.extend(format_attributes_for_display(hist_attrs, "history"))
                         user_prompt += "\n".join(attr_lines) + "\n"
         else:
             # Try to get attributes from historical data
             user_prompt += "\nPhysical attributes (from historical data if available):\n"
             for item_no in new_items_list:
                 attrs = self.history.item_attributes.get(item_no, {})
-                if attrs:
+                if attrs and any(v is not None for v in attrs.values()):
                     attr_lines = [f"  {item_no}:"]
-                    for key, value in attrs.items():
-                        if value is not None:
-                            attr_lines.append(f"    {key}: {value}")
+                    attr_lines.extend(format_attributes_for_display(attrs))
                     user_prompt += "\n".join(attr_lines) + "\n"
 
         if baseline_plan:
@@ -369,6 +402,267 @@ def _plan_to_dataframe(plan: Sequence[Sequence[str]]) -> pd.DataFrame:
     )
 
 
+def _load_uploaded_file(uploaded_file) -> pd.DataFrame:
+    """
+    Load uploaded file (xlsx or csv) and return as DataFrame.
+    
+    Args:
+        uploaded_file: Streamlit uploaded file object
+        
+    Returns:
+        DataFrame with the file contents
+    """
+    try:
+        if uploaded_file.name.endswith('.xlsx') or uploaded_file.name.endswith('.xls'):
+            df = pd.read_excel(uploaded_file)
+        elif uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            raise ValueError(f"Unsupported file format. Please upload .xlsx, .xls, or .csv file.")
+        return df
+    except Exception as e:
+        raise ValueError(f"Error reading file: {str(e)}")
+
+
+def _validate_uploaded_file_columns(df: pd.DataFrame, reference_columns: set) -> Tuple[bool, Optional[str]]:
+    """
+    Validate that uploaded file has required columns.
+    
+    Args:
+        df: DataFrame from uploaded file
+        reference_columns: Set of required column names
+        
+    Returns:
+        (is_valid, error_message)
+    """
+    if "ITEM_NO" not in df.columns:
+        return False, "The uploaded file must contain an 'ITEM_NO' column."
+    
+    # Check if all reference columns exist (ITEM_NO is required, others are optional)
+    missing_required = {"ITEM_NO"} - set(df.columns)
+    if missing_required:
+        return False, f"Missing required columns: {missing_required}"
+    
+    return True, None
+
+
+def _extract_items_from_uploaded_file(df: pd.DataFrame) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
+    """
+    Extract ITEM_NO list and attributes from uploaded file.
+    For duplicate ITEM_NO, aggregate pieces and weights.
+    
+    Args:
+        df: DataFrame from uploaded file
+        
+    Returns:
+        (item_list, item_attributes_dict)
+    """
+    # Ensure ITEM_NO is string
+    df["ITEM_NO"] = df["ITEM_NO"].astype(str).str.strip()
+    
+    # Extract attributes for each item
+    attribute_columns = [
+        "长（毫米）", "宽（毫米）", "高（毫米）", "直径（毫米）",
+        "FG_PRODUCTION_WT_KG", "ORDER_PIECES", "重量（吨）", "形状"
+    ]
+    
+    item_attributes: Dict[str, Dict[str, Any]] = {}
+    items: List[str] = []
+    
+    # Group by ITEM_NO to handle duplicates
+    grouped = df.groupby("ITEM_NO")
+    
+    for item_no, item_group in grouped:
+        items.append(item_no)
+        attrs: Dict[str, Any] = {}
+        
+        # For dimensions and shape, use first non-null value
+        for col in ["长（毫米）", "宽（毫米）", "高（毫米）", "直径（毫米）", "形状"]:
+            if col in df.columns:
+                # Get first non-null value
+                values = item_group[col].dropna()
+                if len(values) > 0:
+                    value = values.iloc[0]
+                    if col == "形状":
+                        attrs[col] = str(value) if pd.notna(value) else None
+                    else:
+                        try:
+                            attrs[col] = float(value)
+                        except (ValueError, TypeError):
+                            attrs[col] = value
+                else:
+                    attrs[col] = None
+            else:
+                attrs[col] = None
+        
+        # For pieces and weights, sum across all rows for the same ITEM_NO
+        for col in ["ORDER_PIECES", "FG_PRODUCTION_WT_KG", "重量（吨）"]:
+            if col in df.columns:
+                values = item_group[col].dropna()
+                if len(values) > 0:
+                    try:
+                        numeric_values = [float(v) for v in values]
+                        attrs[col] = sum(numeric_values)
+                    except (ValueError, TypeError):
+                        # If conversion fails, use first value
+                        attrs[col] = values.iloc[0]
+                else:
+                    attrs[col] = None
+            else:
+                attrs[col] = None
+        
+        item_attributes[item_no] = attrs
+    
+    return items, item_attributes
+
+
+def _parse_loading_plan_from_response(response_text: str, known_items: Optional[List[str]] = None) -> List[List[str]]:
+    """
+    Parse loading plan from OpenAI response text.
+    Attempts to extract truck assignments from natural language.
+    
+    Args:
+        response_text: Natural language response from OpenAI
+        known_items: Optional list of known ITEM_NOs to filter results
+        
+    Returns:
+        List of lists, where each inner list contains ITEM_NOs assigned to one truck
+    """
+    import re
+    
+    plan: List[List[str]] = []
+    known_items_set = set(item.upper() for item in known_items) if known_items else None
+    
+    # Try to find patterns like "Truck 1: ITEM1, ITEM2" or "Load 1: [ITEM1, ITEM2]"
+    # Look for numbered trucks/loads
+    patterns = [
+        r'(?:Truck|Load|Vehicle|车|车辆)\s*(\d+)[:：]\s*([^\n]+)',
+        r'(?:Truck|Load|Vehicle|车|车辆)\s*(\d+)[:：]\s*\[([^\]]+)\]',
+        r'(\d+)\.\s*(?:Truck|Load|Vehicle|车|车辆)[:：]\s*([^\n]+)',
+        r'第\s*(\d+)\s*(?:辆|车|次)[:：]\s*([^\n]+)',
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, response_text, re.IGNORECASE)
+        if matches:
+            for match in matches:
+                items_str = match[1] if len(match) > 1 else match[0]
+                # Extract ITEM_NOs (alphanumeric codes, more flexible pattern)
+                items = re.findall(r'\b[A-Z0-9_]{3,}\b', items_str.upper())
+                # Filter to known items if provided
+                if known_items_set:
+                    items = [item for item in items if item in known_items_set]
+                if items:
+                    plan.append(items)
+            if plan:
+                break
+    
+    # If no structured pattern found, try to extract by lines
+    if not plan:
+        lines = response_text.split('\n')
+        current_load = []
+        for line in lines:
+            # Check if line indicates a new load
+            if re.search(r'(?:Truck|Load|Vehicle|车|车辆|第.*[辆车次])', line, re.IGNORECASE):
+                if current_load:
+                    plan.append(current_load)
+                current_load = []
+            
+            # Extract items from line
+            line_items = re.findall(r'\b[A-Z0-9_]{3,}\b', line.upper())
+            if known_items_set:
+                line_items = [item for item in line_items if item in known_items_set]
+            if line_items:
+                current_load.extend(line_items)
+        
+        if current_load:
+            plan.append(current_load)
+    
+    # If still no plan, try to extract all ITEM_NOs and group them
+    if not plan and known_items:
+        all_items = []
+        for item in known_items:
+            if item.upper() in response_text.upper():
+                all_items.append(item)
+        
+        if all_items:
+            # Try to group by lines or paragraphs
+            paragraphs = response_text.split('\n\n')
+            for para in paragraphs:
+                para_items = [item for item in all_items if item.upper() in para.upper()]
+                if para_items:
+                    plan.append(para_items)
+            
+            # If still no grouping, put all in one load
+            if not plan and all_items:
+                plan.append(all_items)
+    
+    return plan
+
+
+def _plan_to_output_dataframe(
+    plan: List[List[str]],
+    item_attributes: Dict[str, Dict[str, Any]],
+    reference_columns: List[str],
+    load_no_prefix: str = "LOAD"
+) -> pd.DataFrame:
+    """
+    Convert loading plan to DataFrame with same structure as input file.
+    
+    Args:
+        plan: List of lists, each inner list is items in one truck/load
+        item_attributes: Dictionary mapping ITEM_NO to attributes
+        reference_columns: Column names from reference file
+        load_no_prefix: Prefix for LOAD_NO generation
+        
+    Returns:
+        DataFrame with same columns as input file
+    """
+    rows = []
+    
+    for load_idx, load_items in enumerate(plan, start=1):
+        load_no = f"{load_no_prefix}_{load_idx:04d}"
+        
+        for item_no in load_items:
+            # Get attributes for this item
+            attrs = item_attributes.get(item_no, {})
+            
+            # Create row with all reference columns
+            row = {}
+            
+            # Set LOAD_NO
+            row["LOAD_NO"] = load_no
+            
+            # Set ITEM_NO
+            row["ITEM_NO"] = item_no
+            
+            # Fill in physical attributes
+            for col in reference_columns:
+                if col not in ["LOAD_NO", "ITEM_NO"]:
+                    if col in attrs and attrs[col] is not None:
+                        row[col] = attrs[col]
+                    else:
+                        row[col] = None
+            
+            rows.append(row)
+    
+    if not rows:
+        # Return empty DataFrame with reference columns
+        return pd.DataFrame(columns=reference_columns)
+    
+    df = pd.DataFrame(rows)
+    
+    # Ensure all reference columns are present
+    for col in reference_columns:
+        if col not in df.columns:
+            df[col] = None
+    
+    # Reorder columns to match reference
+    df = df[reference_columns]
+    
+    return df
+
+
 def run_streamlit_app() -> None:
     try:
         import streamlit as st
@@ -387,8 +681,6 @@ def run_streamlit_app() -> None:
 
     with st.sidebar:
         st.header("Configuration")
-        data_path_input = st.text_input("Historical data file", "data.xlsx")
-        resolved_data_path = data_path_input.strip() or "data.xlsx"
 
         default_key = os.getenv("OPENAI_API_KEY", DEFAULT_OPENAI_KEY)
         openai_key_input = st.text_input(
@@ -398,7 +690,16 @@ def run_streamlit_app() -> None:
             help="The key is used client-side only for this session.",
         )
 
-        model_name_input = st.text_input("OpenAI model", "gpt-4o-mini")
+        # Advanced settings (hidden by default)
+        base_data_path = "data.xlsx"
+        base_model_name = "gpt-4o-mini"
+        with st.expander("Advanced model & data settings", expanded=False):
+            st.caption("Adjust only if you need to override default data/model paths.")
+            data_path_input = st.text_input("Historical data file", base_data_path, key="data_path_input")
+            model_name_input = st.text_input("OpenAI model", base_model_name, key="model_name_input")
+
+        resolved_data_path = data_path_input.strip() or "data.xlsx"
+
         temperature = st.slider(
             "Generation temperature", min_value=0.0, max_value=1.0, value=0.1, step=0.05
         )
@@ -410,7 +711,7 @@ def run_streamlit_app() -> None:
         top_k = st.slider(
             "Number of frequent combinations to summarise",
             min_value=3,
-            max_value=30,
+            max_value=200,
             value=10,
         )
         show_history = st.checkbox("Show historical summary", value=True)
@@ -434,115 +735,83 @@ def run_streamlit_app() -> None:
 
     st.subheader("New Load Request")
     st.write(
-        "Enter the identifiers of steel items that require loading. "
-        "You can optionally specify physical attributes for each item. "
-        "If attributes are not provided, the system will try to retrieve them from historical data."
+        "Upload a table file (xlsx or csv) containing steel items to load. "
+        "The file should have the same column structure as the historical data file (data.xlsx), "
+        "with at least an 'ITEM_NO' column. Physical attributes will be extracted from the file if available."
     )
 
-    new_items_input = st.text_area(
-        "Steel item identifiers (ITEM_NO)",
-        placeholder="ITEM_001\nITEM_002\nITEM_003",
-        height=120,
-        key="items_input",
+    uploaded_file = st.file_uploader(
+        "Upload steel items file",
+        type=["xlsx", "xls", "csv"],
+        help="Upload a file with columns matching data.xlsx structure (ITEM_NO, 长（毫米）, 宽（毫米）, etc.)"
     )
     
-    parsed_items = _normalize_item_input(new_items_input)
+    parsed_items: List[str] = []
     item_attributes: Optional[Dict[str, Dict[str, Any]]] = None
+    uploaded_df: Optional[pd.DataFrame] = None
     
-    enable_attributes = st.checkbox(
-        "Specify physical attributes manually",
-        value=False,
-        help="If checked, you can input physical attributes for each item. "
-             "Otherwise, attributes will be retrieved from historical data if available."
-    )
-    
-    if enable_attributes and parsed_items:
-        st.write("**Physical Attributes (optional, leave blank to use historical data):**")
-        with st.expander("Edit attributes", expanded=True):
-            for idx, item_no in enumerate(parsed_items):
-                st.write(f"**{item_no}**")
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    length = st.number_input(
-                        "Length (mm)",
-                        min_value=0.0,
-                        value=None,
-                        key=f"length_{idx}",
-                    )
-                with col2:
-                    width = st.number_input(
-                        "Width (mm)",
-                        min_value=0.0,
-                        value=None,
-                        key=f"width_{idx}",
-                    )
-                with col3:
-                    height = st.number_input(
-                        "Height (mm)",
-                        min_value=0.0,
-                        value=None,
-                        key=f"height_{idx}",
-                    )
-                with col4:
-                    diameter = st.number_input(
-                        "Diameter (mm)",
-                        min_value=0.0,
-                        value=None,
-                        key=f"diameter_{idx}",
-                    )
+    if uploaded_file is not None:
+        try:
+            # Load the uploaded file
+            uploaded_df = _load_uploaded_file(uploaded_file)
+            
+            # Validate columns
+            if planner:
+                reference_columns = set(planner.dataframe.columns)
+            else:
+                reference_columns = {"ITEM_NO"}
+            
+            is_valid, error_msg = _validate_uploaded_file_columns(uploaded_df, reference_columns)
+            
+            if not is_valid:
+                st.error(error_msg)
+            else:
+                # Extract items and attributes
+                parsed_items, item_attributes = _extract_items_from_uploaded_file(uploaded_df)
                 
-                col5, col6, col7, col8 = st.columns(4)
-                with col5:
-                    weight_kg = st.number_input(
-                        "Weight (kg)",
-                        min_value=0.0,
-                        value=None,
-                        key=f"weight_kg_{idx}",
-                    )
-                with col6:
-                    pieces = st.number_input(
-                        "Pieces",
-                        min_value=0,
-                        value=None,
-                        key=f"pieces_{idx}",
-                    )
-                with col7:
-                    weight_ton = st.number_input(
-                        "Weight (ton)",
-                        min_value=0.0,
-                        value=None,
-                        key=f"weight_ton_{idx}",
-                    )
-                with col8:
-                    shape = st.text_input(
-                        "Shape",
-                        value="",
-                        key=f"shape_{idx}",
-                    )
+                st.success(f"Successfully loaded {len(parsed_items)} unique steel items from the file.")
                 
-                attrs: Dict[str, Any] = {}
-                if length is not None:
-                    attrs["长（毫米）"] = length
-                if width is not None:
-                    attrs["宽（毫米）"] = width
-                if height is not None:
-                    attrs["高（毫米）"] = height
-                if diameter is not None:
-                    attrs["直径（毫米）"] = diameter
-                if weight_kg is not None:
-                    attrs["FG_PRODUCTION_WT_KG"] = weight_kg
-                if pieces is not None:
-                    attrs["ORDER_PIECES"] = int(pieces)
-                if weight_ton is not None:
-                    attrs["重量（吨）"] = weight_ton
-                if shape:
-                    attrs["形状"] = shape
+                # Display preview
+                with st.expander("Preview uploaded data", expanded=False):
+                    st.write(f"**Total rows:** {len(uploaded_df)}")
+                    st.write(f"**Unique items:** {len(parsed_items)}")
+                    st.dataframe(uploaded_df.head(10), use_container_width=True)
                 
-                if attrs:
-                    if item_attributes is None:
-                        item_attributes = {}
-                    item_attributes[item_no] = attrs
-                st.divider()
+                # Display extracted items and attributes
+                if parsed_items:
+                    st.write(f"**Items to load:** {len(parsed_items)} unique items")
+                    
+                    # Display detailed attributes table
+                    if item_attributes:
+                        attrs_with_data = {
+                            item: attrs for item, attrs in item_attributes.items()
+                            if any(v is not None for v in attrs.values())
+                        }
+                        if attrs_with_data:
+                            st.info(f"Physical attributes found for {len(attrs_with_data)} items.")
+                            
+                            # Create a summary table of attributes
+                            with st.expander("View extracted physical attributes", expanded=True):
+                                attr_rows = []
+                                for item_no, attrs in item_attributes.items():
+                                    row = {"ITEM_NO": item_no}
+                                    # Add physical attributes
+                                    row["Length (mm)"] = attrs.get("长（毫米）", "N/A")
+                                    row["Width (mm)"] = attrs.get("宽（毫米）", "N/A")
+                                    row["Height (mm)"] = attrs.get("高（毫米）", "N/A")
+                                    row["Diameter (mm)"] = attrs.get("直径（毫米）", "N/A")
+                                    row["Weight (kg)"] = attrs.get("FG_PRODUCTION_WT_KG", "N/A")
+                                    row["Pieces"] = attrs.get("ORDER_PIECES", "N/A")
+                                    row["Weight (ton)"] = attrs.get("重量（吨）", "N/A")
+                                    row["Shape"] = attrs.get("形状", "N/A")
+                                    attr_rows.append(row)
+                                
+                                if attr_rows:
+                                    attr_df = pd.DataFrame(attr_rows)
+                                    st.dataframe(attr_df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"Error processing uploaded file: {str(e)}")
+            uploaded_df = None
 
     openai_result: Optional[Dict[str, Any]] = None
     
@@ -550,7 +819,7 @@ def run_streamlit_app() -> None:
         if planner is None:
             st.error(planner_error or "Planner could not be initialised.")
         elif not parsed_items:
-            st.warning("Please provide at least one steel item.")
+            st.warning("Please upload a file with steel items first.")
         else:
             try:
                 openai_result = planner.plan_with_openai(
@@ -572,6 +841,51 @@ def run_streamlit_app() -> None:
         else:
             st.warning("The model did not return any content.")
 
+        # Display physical attributes used in planning
+        if item_attributes and parsed_items:
+            with st.expander("Physical attributes used for planning", expanded=False):
+                attr_summary_rows = []
+                for item_no in parsed_items:
+                    attrs = item_attributes.get(item_no, {})
+                    row = {"ITEM_NO": item_no}
+                    # Format attributes for display
+                    if attrs.get("长（毫米）") is not None:
+                        row["Length (mm)"] = f"{attrs['长（毫米）']:.2f}" if isinstance(attrs['长（毫米）'], (int, float)) else attrs['长（毫米）']
+                    else:
+                        row["Length (mm)"] = "N/A"
+                    
+                    if attrs.get("宽（毫米）") is not None:
+                        row["Width (mm)"] = f"{attrs['宽（毫米）']:.2f}" if isinstance(attrs['宽（毫米）'], (int, float)) else attrs['宽（毫米）']
+                    else:
+                        row["Width (mm)"] = "N/A"
+                    
+                    if attrs.get("高（毫米）") is not None:
+                        row["Height (mm)"] = f"{attrs['高（毫米）']:.2f}" if isinstance(attrs['高（毫米）'], (int, float)) else attrs['高（毫米）']
+                    else:
+                        row["Height (mm)"] = "N/A"
+                    
+                    if attrs.get("ORDER_PIECES") is not None:
+                        row["Pieces"] = int(attrs['ORDER_PIECES']) if isinstance(attrs['ORDER_PIECES'], (int, float)) else attrs['ORDER_PIECES']
+                    else:
+                        row["Pieces"] = "N/A"
+                    
+                    if attrs.get("FG_PRODUCTION_WT_KG") is not None:
+                        row["Weight (kg)"] = f"{attrs['FG_PRODUCTION_WT_KG']:.2f}" if isinstance(attrs['FG_PRODUCTION_WT_KG'], (int, float)) else attrs['FG_PRODUCTION_WT_KG']
+                    else:
+                        row["Weight (kg)"] = "N/A"
+                    
+                    if attrs.get("重量（吨）") is not None:
+                        row["Weight (ton)"] = f"{attrs['重量（吨）']:.3f}" if isinstance(attrs['重量（吨）'], (int, float)) else attrs['重量（吨）']
+                    else:
+                        row["Weight (ton)"] = "N/A"
+                    
+                    row["Shape"] = attrs.get("形状", "N/A")
+                    attr_summary_rows.append(row)
+                
+                if attr_summary_rows:
+                    attr_summary_df = pd.DataFrame(attr_summary_rows)
+                    st.dataframe(attr_summary_df, use_container_width=True, hide_index=True)
+
         if openai_result.get("baseline_plan"):
             with st.expander("Baseline provided to the model"):
                 st.dataframe(
@@ -579,12 +893,83 @@ def run_streamlit_app() -> None:
                     use_container_width=True,
                 )
 
-        st.download_button(
-            "Download OpenAI response",
-            data=json.dumps(openai_result, indent=2, ensure_ascii=False),
-            file_name="loading_plan.json",
-            mime="application/json",
-        )
+        # Generate output CSV with same format as input file
+        output_df: Optional[pd.DataFrame] = None
+        if response_text and item_attributes and parsed_items:
+            try:
+                # Parse loading plan from response
+                parsed_plan = _parse_loading_plan_from_response(response_text, known_items=parsed_items)
+                
+                # If parsing failed, try using baseline plan
+                if not parsed_plan and openai_result.get("baseline_plan"):
+                    parsed_plan = openai_result["baseline_plan"]
+                
+                if parsed_plan:
+                    # Get reference columns from uploaded file or planner
+                    if uploaded_df is not None:
+                        reference_columns = uploaded_df.columns.tolist()
+                    elif planner:
+                        reference_columns = planner.dataframe.columns.tolist()
+                    else:
+                        # Default columns if neither available
+                        reference_columns = ["LOAD_NO", "ITEM_NO", "长（毫米）", "宽（毫米）", 
+                                           "高（毫米）", "直径（毫米）", "FG_PRODUCTION_WT_KG", 
+                                           "ORDER_PIECES", "重量（吨）", "形状"]
+                    
+                    # Convert plan to DataFrame
+                    output_df = _plan_to_output_dataframe(
+                        parsed_plan,
+                        item_attributes,
+                        reference_columns
+                    )
+                    
+                    # Display preview
+                    with st.expander("Preview output table (same format as input)", expanded=False):
+                        st.write(f"**Total rows:** {len(output_df)}")
+                        st.write(f"**Number of loads:** {output_df['LOAD_NO'].nunique() if 'LOAD_NO' in output_df.columns else 0}")
+                        st.dataframe(output_df.head(20), use_container_width=True)
+            except Exception as e:
+                st.warning(f"Could not generate output table: {str(e)}")
+                output_df = None
+
+        # Download buttons
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # CSV download button
+            if output_df is not None and len(output_df) > 0:
+                csv_data = output_df.to_csv(index=False, encoding='utf-8-sig')
+                st.download_button(
+                    "Download as CSV",
+                    data=csv_data,
+                    file_name="loading_plan_output.csv",
+                    mime="text/csv",
+                    help="Download the loading plan in CSV format matching the input file structure"
+                )
+            else:
+                st.download_button(
+                    "Download as CSV",
+                    data="",
+                    file_name="loading_plan_output.csv",
+                    mime="text/csv",
+                    disabled=True,
+                    help="No valid plan to export"
+                )
+        
+        with col2:
+            # JSON download button
+            download_data = openai_result.copy()
+            if item_attributes:
+                download_data["item_attributes"] = item_attributes
+            if output_df is not None:
+                download_data["output_table"] = output_df.to_dict('records')
+            
+            st.download_button(
+                "Download as JSON",
+                data=json.dumps(download_data, indent=2, ensure_ascii=False, default=str),
+                file_name="loading_plan.json",
+                mime="application/json",
+            )
 
     if planner_error and planner is None:
         st.error(planner_error)
