@@ -62,8 +62,8 @@ class SteelLoadingPlanner:
         
         # Keep physical attribute columns if they exist
         attribute_columns = [
-            "长（毫米）", "宽（毫米）", "高（毫米）", "直径（毫米）",
-            "FG_PRODUCTION_WT_KG", "ORDER_PIECES", "重量（吨）", "形状"
+            "LENGTH", "WIDTH", "HEIGHT", "DIAMETER",
+            "ORDER_PIECES", "WEIGHT", "SHAPE"
         ]
         return df
 
@@ -77,8 +77,8 @@ class SteelLoadingPlanner:
         # Extract physical attributes for each ITEM_NO
         item_attributes: Dict[str, Dict[str, Any]] = {}
         attribute_columns = [
-            "长（毫米）", "宽（毫米）", "高（毫米）", "直径（毫米）",
-            "FG_PRODUCTION_WT_KG", "ORDER_PIECES", "重量（吨）", "形状"
+            "LENGTH", "WIDTH", "HEIGHT", "DIAMETER",
+            "ORDER_PIECES", "WEIGHT", "SHAPE"
         ]
         
         for item_no in self.dataframe["ITEM_NO"].unique():
@@ -87,16 +87,19 @@ class SteelLoadingPlanner:
             for col in attribute_columns:
                 if col in self.dataframe.columns:
                     value = item_data[col]
-                    # Convert to appropriate type
                     if pd.notna(value):
-                        if col in ["长（毫米）", "宽（毫米）", "高（毫米）", "直径（毫米）", 
-                                   "FG_PRODUCTION_WT_KG", "ORDER_PIECES", "重量（吨）"]:
+                        if col in ["LENGTH", "WIDTH", "HEIGHT", "DIAMETER", "WEIGHT"]:
                             try:
                                 attrs[col] = float(value)
                             except (ValueError, TypeError):
                                 attrs[col] = value
+                        elif col == "ORDER_PIECES":
+                            try:
+                                attrs[col] = int(float(value))
+                            except (ValueError, TypeError):
+                                attrs[col] = value
                         else:
-                            attrs[col] = str(value) if pd.notna(value) else None
+                            attrs[col] = str(value)
                     else:
                         attrs[col] = None
             item_attributes[item_no] = attrs
@@ -124,18 +127,21 @@ class SteelLoadingPlanner:
                         if col in self.dataframe.columns:
                             value = item_data[col]
                             if pd.notna(value):
-                                if col in ["FG_PRODUCTION_WT_KG", "ORDER_PIECES", "重量（吨）"]:
-                                    try:
+                                try:
+                                    if col == "WEIGHT":
+                                        ton_value = float(value)
+                                        item_attrs[col] = ton_value
+                                        total_weight_ton += ton_value
+                                        total_weight_kg += ton_value * 1000
+                                    elif col == "ORDER_PIECES":
+                                        pieces_value = int(float(value))
+                                        item_attrs[col] = pieces_value
+                                        total_pieces += pieces_value
+                                    elif col in ["LENGTH", "WIDTH", "HEIGHT", "DIAMETER"]:
                                         item_attrs[col] = float(value)
-                                        if col == "FG_PRODUCTION_WT_KG":
-                                            total_weight_kg += float(value)
-                                        elif col == "重量（吨）":
-                                            total_weight_ton += float(value)
-                                        elif col == "ORDER_PIECES":
-                                            total_pieces += int(value)
-                                    except (ValueError, TypeError):
-                                        pass
-                                else:
+                                    else:
+                                        item_attrs[col] = str(value)
+                                except (ValueError, TypeError):
                                     item_attrs[col] = value
                     item_details.append({"ITEM_NO": item_no, "attributes": item_attrs})
             
@@ -208,8 +214,8 @@ class SteelLoadingPlanner:
         attrs = self.history.item_attributes
         if attrs:
             # Calculate statistics for numeric attributes
-            numeric_cols = ["长（毫米）", "宽（毫米）", "高（毫米）", "直径（毫米）", 
-                           "FG_PRODUCTION_WT_KG", "ORDER_PIECES", "重量（吨）"]
+            numeric_cols = ["LENGTH", "WIDTH", "HEIGHT", "DIAMETER", 
+                           "ORDER_PIECES", "WEIGHT"]
             for col in numeric_cols:
                 values = [v.get(col) for v in attrs.values() if v.get(col) is not None]
                 if values:
@@ -224,7 +230,7 @@ class SteelLoadingPlanner:
                         pass
             
             # Shape distribution
-            shapes = [v.get("形状") for v in attrs.values() if v.get("形状")]
+            shapes = [v.get("SHAPE") for v in attrs.values() if v.get("SHAPE")]
             if shapes:
                 shape_counter = Counter(shapes)
                 summary_lines.append("  Shape distribution:")
@@ -264,11 +270,10 @@ class SteelLoadingPlanner:
         if item_attributes:
             for item_no in new_items:
                 attrs = item_attributes.get(item_no, {})
-                if attrs:
-                    if attrs.get("FG_PRODUCTION_WT_KG"):
-                        new_total_weight_kg += float(attrs["FG_PRODUCTION_WT_KG"])
-                    if attrs.get("重量（吨）"):
-                        new_total_weight_ton += float(attrs["重量（吨）"])
+                if attrs and attrs.get("WEIGHT"):
+                    ton_value = float(attrs["WEIGHT"])
+                    new_total_weight_ton += ton_value
+                    new_total_weight_kg += ton_value * 1000
                     if attrs.get("ORDER_PIECES"):
                         new_total_pieces += int(attrs["ORDER_PIECES"])
         
@@ -408,18 +413,20 @@ class SteelLoadingPlanner:
                         attrs = item_detail['attributes']
                         user_prompt += f"    {item_no}: "
                         attr_parts = []
-                        if attrs.get("长（毫米）"):
-                            attr_parts.append(f"L={attrs['长（毫米）']:.0f}mm")
-                        if attrs.get("宽（毫米）"):
-                            attr_parts.append(f"W={attrs['宽（毫米）']:.0f}mm")
-                        if attrs.get("高（毫米）"):
-                            attr_parts.append(f"H={attrs['高（毫米）']:.0f}mm")
-                        if attrs.get("FG_PRODUCTION_WT_KG"):
-                            attr_parts.append(f"Weight={attrs['FG_PRODUCTION_WT_KG']:.2f}kg")
+                        if attrs.get("LENGTH"):
+                            attr_parts.append(f"L={attrs['LENGTH']:.0f}mm")
+                        if attrs.get("WIDTH"):
+                            attr_parts.append(f"W={attrs['WIDTH']:.0f}mm")
+                        if attrs.get("HEIGHT"):
+                            attr_parts.append(f"H={attrs['HEIGHT']:.0f}mm")
+                        if attrs.get("WEIGHT"):
+                            ton_val = attrs["WEIGHT"]
+                            attr_parts.append(f"Weight={ton_val:.3f} ton")
+                            attr_parts.append(f"Weight={ton_val * 1000:.1f} kg")
                         if attrs.get("ORDER_PIECES"):
                             attr_parts.append(f"Pieces={int(attrs['ORDER_PIECES'])}")
-                        if attrs.get("形状"):
-                            attr_parts.append(f"Shape={attrs['形状']}")
+                        if attrs.get("SHAPE"):
+                            attr_parts.append(f"Shape={attrs['SHAPE']}")
                         user_prompt += ", ".join(attr_parts) + "\n"
                 user_prompt += "\n"
         else:
@@ -433,12 +440,10 @@ class SteelLoadingPlanner:
             if value is None:
                 return "N/A"
             if isinstance(value, (int, float)):
-                if key in ["长（毫米）", "宽（毫米）", "高（毫米）", "直径（毫米）"]:
+                if key in ["LENGTH", "WIDTH", "HEIGHT", "DIAMETER"]:
                     return f"{value:.2f} mm"
-                elif key == "FG_PRODUCTION_WT_KG":
-                    return f"{value:.2f} kg"
-                elif key == "重量（吨）":
-                    return f"{value:.3f} ton"
+                elif key == "WEIGHT":
+                    return f"{value:.3f} ton ({value * 1000:.1f} kg)"
                 elif key == "ORDER_PIECES":
                     return f"{int(value)} pieces"
                 else:
@@ -448,16 +453,15 @@ class SteelLoadingPlanner:
         def format_attributes_for_display(attrs: Dict[str, Any], source: str = "") -> List[str]:
             """Format attributes into readable lines."""
             attr_lines = []
-            # Map Chinese column names to English for better readability
+            # Map column names to display names for better readability
             attr_mapping = {
-                "长（毫米）": "Length",
-                "宽（毫米）": "Width", 
-                "高（毫米）": "Height",
-                "直径（毫米）": "Diameter",
-                "FG_PRODUCTION_WT_KG": "Weight (kg)",
+                "LENGTH": "Length",
+                "WIDTH": "Width", 
+                "HEIGHT": "Height",
+                "DIAMETER": "Diameter",
                 "ORDER_PIECES": "Pieces",
-                "重量（吨）": "Weight (ton)",
-                "形状": "Shape"
+                "WEIGHT": "Weight",
+                "SHAPE": "Shape"
             }
             
             for key, value in attrs.items():
@@ -635,8 +639,8 @@ def _extract_items_from_uploaded_file(df: pd.DataFrame) -> Tuple[List[str], Dict
     
     # Extract attributes for each item
     attribute_columns = [
-        "长（毫米）", "宽（毫米）", "高（毫米）", "直径（毫米）",
-        "FG_PRODUCTION_WT_KG", "ORDER_PIECES", "重量（吨）", "形状"
+        "LENGTH", "WIDTH", "HEIGHT", "DIAMETER",
+        "ORDER_PIECES", "WEIGHT", "SHAPE"
     ]
     
     item_attributes: Dict[str, Dict[str, Any]] = {}
@@ -650,13 +654,13 @@ def _extract_items_from_uploaded_file(df: pd.DataFrame) -> Tuple[List[str], Dict
         attrs: Dict[str, Any] = {}
         
         # For dimensions and shape, use first non-null value
-        for col in ["长（毫米）", "宽（毫米）", "高（毫米）", "直径（毫米）", "形状"]:
+        for col in ["LENGTH", "WIDTH", "HEIGHT", "DIAMETER", "SHAPE"]:
             if col in df.columns:
                 # Get first non-null value
                 values = item_group[col].dropna()
                 if len(values) > 0:
                     value = values.iloc[0]
-                    if col == "形状":
+                    if col == "SHAPE":
                         attrs[col] = str(value) if pd.notna(value) else None
                     else:
                         try:
@@ -669,13 +673,14 @@ def _extract_items_from_uploaded_file(df: pd.DataFrame) -> Tuple[List[str], Dict
                 attrs[col] = None
         
         # For pieces and weights, sum across all rows for the same ITEM_NO
-        for col in ["ORDER_PIECES", "FG_PRODUCTION_WT_KG", "重量（吨）"]:
+        for col in ["ORDER_PIECES", "WEIGHT"]:
             if col in df.columns:
                 values = item_group[col].dropna()
                 if len(values) > 0:
                     try:
                         numeric_values = [float(v) for v in values]
-                        attrs[col] = sum(numeric_values)
+                        total_value = sum(numeric_values)
+                        attrs[col] = total_value
                     except (ValueError, TypeError):
                         # If conversion fails, use first value
                         attrs[col] = values.iloc[0]
@@ -916,7 +921,7 @@ def run_streamlit_app() -> None:
     uploaded_file = st.file_uploader(
         "Upload steel items file",
         type=["xlsx", "xls", "csv"],
-        help="Upload a file with columns matching data.xlsx structure (ITEM_NO, 长（毫米）, 宽（毫米）, etc.)"
+        help="Upload a file with columns matching data.xlsx structure (ITEM_NO, LENGTH, WIDTH, HEIGHT, etc.)"
     )
     
     parsed_items: List[str] = []
@@ -969,14 +974,19 @@ def run_streamlit_app() -> None:
                                 for item_no, attrs in item_attributes.items():
                                     row = {"ITEM_NO": item_no}
                                     # Add physical attributes
-                                    row["Length (mm)"] = attrs.get("长（毫米）", "N/A")
-                                    row["Width (mm)"] = attrs.get("宽（毫米）", "N/A")
-                                    row["Height (mm)"] = attrs.get("高（毫米）", "N/A")
-                                    row["Diameter (mm)"] = attrs.get("直径（毫米）", "N/A")
-                                    row["Weight (kg)"] = attrs.get("FG_PRODUCTION_WT_KG", "N/A")
+                                    row["Length (mm)"] = attrs.get("LENGTH", "N/A")
+                                    row["Width (mm)"] = attrs.get("WIDTH", "N/A")
+                                    row["Height (mm)"] = attrs.get("HEIGHT", "N/A")
+                                    row["Diameter (mm)"] = attrs.get("DIAMETER", "N/A")
+                                    ton_value = attrs.get("WEIGHT")
+                                    if isinstance(ton_value, (int, float)):
+                                        row["Weight (kg)"] = f"{ton_value * 1000:.1f}"
+                                        row["Weight (ton)"] = f"{ton_value:.3f}"
+                                    else:
+                                        row["Weight (kg)"] = "N/A"
+                                        row["Weight (ton)"] = ton_value if ton_value is not None else "N/A"
                                     row["Pieces"] = attrs.get("ORDER_PIECES", "N/A")
-                                    row["Weight (ton)"] = attrs.get("重量（吨）", "N/A")
-                                    row["Shape"] = attrs.get("形状", "N/A")
+                                    row["Shape"] = attrs.get("SHAPE", "N/A")
                                     attr_rows.append(row)
                                 
                                 if attr_rows:
@@ -1040,18 +1050,18 @@ def run_streamlit_app() -> None:
                     attrs = item_attributes.get(item_no, {})
                     row = {"ITEM_NO": item_no}
                     # Format attributes for display
-                    if attrs.get("长（毫米）") is not None:
-                        row["Length (mm)"] = f"{attrs['长（毫米）']:.2f}" if isinstance(attrs['长（毫米）'], (int, float)) else attrs['长（毫米）']
+                    if attrs.get("LENGTH") is not None:
+                        row["Length (mm)"] = f"{attrs['LENGTH']:.2f}" if isinstance(attrs['LENGTH'], (int, float)) else attrs['LENGTH']
                     else:
                         row["Length (mm)"] = "N/A"
                     
-                    if attrs.get("宽（毫米）") is not None:
-                        row["Width (mm)"] = f"{attrs['宽（毫米）']:.2f}" if isinstance(attrs['宽（毫米）'], (int, float)) else attrs['宽（毫米）']
+                    if attrs.get("WIDTH") is not None:
+                        row["Width (mm)"] = f"{attrs['WIDTH']:.2f}" if isinstance(attrs['WIDTH'], (int, float)) else attrs['WIDTH']
                     else:
                         row["Width (mm)"] = "N/A"
                     
-                    if attrs.get("高（毫米）") is not None:
-                        row["Height (mm)"] = f"{attrs['高（毫米）']:.2f}" if isinstance(attrs['高（毫米）'], (int, float)) else attrs['高（毫米）']
+                    if attrs.get("HEIGHT") is not None:
+                        row["Height (mm)"] = f"{attrs['HEIGHT']:.2f}" if isinstance(attrs['HEIGHT'], (int, float)) else attrs['HEIGHT']
                     else:
                         row["Height (mm)"] = "N/A"
                     
@@ -1060,17 +1070,14 @@ def run_streamlit_app() -> None:
                     else:
                         row["Pieces"] = "N/A"
                     
-                    if attrs.get("FG_PRODUCTION_WT_KG") is not None:
-                        row["Weight (kg)"] = f"{attrs['FG_PRODUCTION_WT_KG']:.2f}" if isinstance(attrs['FG_PRODUCTION_WT_KG'], (int, float)) else attrs['FG_PRODUCTION_WT_KG']
+                    if attrs.get("WEIGHT") is not None and isinstance(attrs['WEIGHT'], (int, float)):
+                        row["Weight (ton)"] = f"{attrs['WEIGHT']:.3f}"
+                        row["Weight (kg)"] = f"{attrs['WEIGHT'] * 1000:.1f}"
                     else:
+                        row["Weight (ton)"] = attrs.get("WEIGHT", "N/A")
                         row["Weight (kg)"] = "N/A"
                     
-                    if attrs.get("重量（吨）") is not None:
-                        row["Weight (ton)"] = f"{attrs['重量（吨）']:.3f}" if isinstance(attrs['重量（吨）'], (int, float)) else attrs['重量（吨）']
-                    else:
-                        row["Weight (ton)"] = "N/A"
-                    
-                    row["Shape"] = attrs.get("形状", "N/A")
+                    row["Shape"] = attrs.get("SHAPE", "N/A")
                     attr_summary_rows.append(row)
                 
                 if attr_summary_rows:
@@ -1103,9 +1110,9 @@ def run_streamlit_app() -> None:
                         reference_columns = planner.dataframe.columns.tolist()
                     else:
                         # Default columns if neither available
-                        reference_columns = ["LOAD_NO", "ITEM_NO", "长（毫米）", "宽（毫米）", 
-                                           "高（毫米）", "直径（毫米）", "FG_PRODUCTION_WT_KG", 
-                                           "ORDER_PIECES", "重量（吨）", "形状"]
+                        reference_columns = ["LOAD_NO", "ITEM_NO", "LENGTH", "WIDTH", 
+                                           "HEIGHT", "DIAMETER",
+                                           "ORDER_PIECES", "WEIGHT", "SHAPE"]
                     
                     # Convert plan to DataFrame
                     output_df = _plan_to_output_dataframe(
